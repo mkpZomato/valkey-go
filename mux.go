@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -11,6 +12,12 @@ import (
 
 	"github.com/valkey-io/valkey-go/internal/cmds"
 	"github.com/valkey-io/valkey-go/internal/util"
+)
+
+const (
+	loadingEtaSecondsKey = "loading_eta_seconds:"
+	maxRetryableErrors   = 5                // max number of retryable errors before the node is considered unhealthy
+	maxUnhealthyDuration = 15 * time.Second // max time in seconds to consider the node unhealthy
 )
 
 type connFn func(dst string, opt *ClientOption) conn
@@ -43,6 +50,7 @@ type conn interface {
 	Addr() string
 	SetOnCloseHook(func(error))
 	OptInCmd() cmds.Completed
+	InUnHealthy() bool
 }
 
 var _ conn = (*mux)(nil)
@@ -61,8 +69,10 @@ type mux struct {
 	maxp   int
 	maxm   int
 
-	usePool bool
-	optIn   bool
+	usePool            bool
+	optIn              bool
+	nodeHealthyStatus  atomic.Uint32
+	numRetryableErrors atomic.Uint32 // number of retryable errors since the last successful command
 }
 
 func makeMux(dst string, option *ClientOption, dialFn dialFn) *mux {
@@ -267,6 +277,8 @@ func (m *mux) blocking(pool *pool, ctx context.Context, cmd Completed) (resp Val
 	if resp.NonValkeyError() != nil { // abort the wire if blocking command return early (ex. context.DeadlineExceeded)
 		wire.Close()
 	}
+	m.updateHealth(ctx, resp.Error())
+
 	pool.Store(wire)
 	return resp
 }
@@ -279,6 +291,7 @@ func (m *mux) blockingMulti(pool *pool, ctx context.Context, cmd []Completed) (r
 			wire.Close()
 			break
 		}
+		m.updateHealth(ctx, res.Error())
 	}
 	pool.Store(wire)
 	return resp
@@ -290,6 +303,7 @@ func (m *mux) pipeline(ctx context.Context, cmd Completed) (resp ValkeyResult) {
 	if resp = wire.Do(ctx, cmd); isBroken(resp.NonValkeyError(), wire) {
 		m.wire[slot].CompareAndSwap(wire, m.init)
 	}
+	m.updateHealth(ctx, resp.Error())
 	return resp
 }
 
@@ -302,6 +316,7 @@ func (m *mux) pipelineMulti(ctx context.Context, cmd []Completed) (resp *valkeyr
 			m.wire[slot].CompareAndSwap(wire, m.init)
 			return resp
 		}
+		m.updateHealth(ctx, r.Error())
 	}
 	return resp
 }
@@ -313,6 +328,8 @@ func (m *mux) DoCache(ctx context.Context, cmd Cacheable, ttl time.Duration) Val
 	if isBroken(resp.NonValkeyError(), wire) {
 		m.wire[slot].CompareAndSwap(wire, m.init)
 	}
+	m.updateHealth(ctx, resp.Error())
+
 	return resp
 }
 
@@ -373,6 +390,7 @@ func (m *mux) doMultiCache(ctx context.Context, slot uint16, multi []CacheableTT
 			m.wire[slot].CompareAndSwap(wire, m.init)
 			return resps
 		}
+		m.updateHealth(ctx, r.Error())
 	}
 	return resps
 }
@@ -411,8 +429,87 @@ func (m *mux) Addr() string {
 	return m.dst
 }
 
+// sets the loading status for the node until the loading eta is reached
+func (m *mux) setLoadingStatus(ctx context.Context) {
+	globalLogger.Debugf("[valkey]setting loading status of node %s", m.dst)
+	w := m.pipe(ctx, 0)
+	res := w.Do(ctx, cmds.InfoPersistenceCmd)
+	r := res.String()
+	loadingEtaIdx := strings.Index(r, loadingEtaSecondsKey)
+	if loadingEtaIdx > 0 {
+		eta, _ := strconv.Atoi(string(r[loadingEtaIdx+len(loadingEtaSecondsKey)]))
+		if eta > 0 {
+			// this sets the time when the loading status will be expired
+			etaTime := time.Now().Add(time.Duration(eta) * time.Second).Unix()
+			m.nodeHealthyStatus.CompareAndSwap(0, uint32(etaTime))
+			globalLogger.Debugf("[valkey]node %s is loading, eta %d seconds, will be healthy again at %s", m.dst, eta, time.Unix(etaTime, 0).Format(time.RFC3339))
+		}
+	}
+}
+
+type timeoutError interface {
+	Timeout() bool
+}
+
+func (m *mux) updateHealth(ctx context.Context, err error) {
+	if err == nil {
+		return
+	}
+
+	if !m.InUnHealthy() && isLoadingError(err) {
+		m.setLoadingStatus(ctx)
+	} else if isRetryableError(err) {
+		if m.numRetryableErrors.Add(1) >= maxRetryableErrors {
+			globalLogger.Debugf("[valkey]node %s is unhealthy for %f seconds, too many retryable errors: %d", m.dst, maxUnhealthyDuration.Seconds(), m.numRetryableErrors.Load())
+			// sets the node to unhealthy for maxUnhealthyDuration
+			maxUnHealthyTime := time.Now().Add(maxUnhealthyDuration).Unix()
+			m.nodeHealthyStatus.CompareAndSwap(0, uint32(maxUnHealthyTime))
+		}
+	} else {
+		m.numRetryableErrors.Store(0) // reset the retryable errors count
+	}
+}
+
+func isRetryableError(err error) bool {
+	if err == nil {
+		return false
+	}
+	// currently we will consider only timeout errors as retryable
+	if verr, ok := err.(timeoutError); ok && verr.Timeout() {
+		return true
+	}
+	return false
+}
+
+func (m *mux) InUnHealthy() bool {
+
+	status := m.nodeHealthyStatus.Load()
+	if status == 0 {
+		return false
+	}
+
+	if time.Now().Unix() < int64(status) {
+		return true
+	}
+
+	m.nodeHealthyStatus.Store(0) // reset the status if expired
+	globalLogger.Debugf("[valkey]unhealthy status is expired, marking the node %s healthy again", m.dst)
+
+	return false
+}
+
 func isBroken(err error, w wire) bool {
 	return err != nil && err != ErrClosing && w.Error() != nil
+}
+
+func isLoadingError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if verr, ok := err.(*ValkeyError); ok {
+		return verr.IsLoading()
+	}
+	return false
 }
 
 func slotfn(n int, ks uint16, noreply bool) uint16 {

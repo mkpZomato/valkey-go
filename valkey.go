@@ -243,6 +243,9 @@ type ClientOption struct {
 	// EnableReplicaAZInfo enables the client to load the replica node's availability zone.
 	// If true, the client will set the `AZ` field in `ReplicaInfo`.
 	EnableReplicaAZInfo bool
+
+	// This enables unhealthy node handling that automatically detects unhealthy nodes in various scenarios like high error rate and loading status.
+	EnableUnHealthyNodeHandling bool
 }
 
 // SentinelOption contains MasterSet,
